@@ -15,7 +15,7 @@
 
 ## 📂 Machines
 
-### 🐧 Linux 
+### 🐧 Linux - Easy
 | Machine | Difficulty | Link |
 |:--------|:-----------|:-----|
 | **Paperwork** | Easy | [Writeup](https://npx-official.github.io/HTB-WRITEUPS-MACHINES/easy/Paperwork.html) |
@@ -27,6 +27,9 @@
 | **Orion** | Easy | [Writeup](./easy/Orion.md) |
 | **Reactor** | Easy | [Writeup](./easy/Reactor.md) |
 | **Silentium** | Easy | [Writeup](./easy/Silentium.md) |
+### 🐧 Linux - Medium
+| Machine | Difficulty | Link |
+|:--------|:-----------|:-----|
 | **Fireflow** | Medium | [Writeup](./Medium/Fireflow.md) |
 | **MakeSense** | Medium | [Writeup](./Medium/MakeSense.md) |
 | **DevArea** | Medium | [Writeup](./Medium/DevArea.md) |
